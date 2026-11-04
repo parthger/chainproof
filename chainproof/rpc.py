@@ -16,7 +16,7 @@ from typing import Any, Protocol
 
 import requests
 
-USER_AGENT = "chainproof/0.1 (+https://github.com)"
+USER_AGENT = "chainproof/0.1 (+https://github.com/parthger/chainproof)"
 
 _RANGE_HINTS = (
     "range",

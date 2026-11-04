@@ -81,7 +81,7 @@ One invariant is never enough. A holder-to-holder transfer with a wrong amount d
 ## Quickstart
 
 ```bash
-git clone https://github.com/<you>/chainproof && cd chainproof
+git clone https://github.com/parthger/chainproof && cd chainproof
 python -m venv .venv && source .venv/bin/activate
 pip install -e '.[dev]'
 
