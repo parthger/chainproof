@@ -1,0 +1,62 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 6 * * *" # daily live proof against mainnet
+  workflow_dispatch:
+
+jobs:
+  offline:
+    name: tests (fake chain, no network)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e '.[dev]'
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: pytest
+
+  live:
+    name: live reconciliation (${{ matrix.chain }})
+    needs: offline
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        chain: [base, ethereum, arbitrum]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+      # Persist the database between runs so each day continues from yesterday's watermark.
+      - uses: actions/cache@v4
+        with:
+          path: chainproof-${{ matrix.chain }}.duckdb
+          key: db-${{ matrix.chain }}-${{ github.run_id }}
+          restore-keys: db-${{ matrix.chain }}-
+      - name: inspect contract
+        run: chainproof inspect --chain ${{ matrix.chain }}
+      - name: index + reconcile (fails the job on any difference)
+        run: >
+          chainproof run --chain ${{ matrix.chain }} --db chainproof-${{ matrix.chain }}.duckdb
+          --blocks 300 --max-blocks 1500 --auto-rewind --json run-${{ matrix.chain }}.json
+      - name: report
+        if: always()
+        run: |
+          chainproof status --chain ${{ matrix.chain }} --db chainproof-${{ matrix.chain }}.duckdb >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+          chainproof report --chain ${{ matrix.chain }} --db chainproof-${{ matrix.chain }}.duckdb >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: run-${{ matrix.chain }}
+          path: run-${{ matrix.chain }}.json
+          if-no-files-found: ignore
