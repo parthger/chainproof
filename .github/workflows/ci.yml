@@ -4,8 +4,13 @@ on:
   push:
   pull_request:
   schedule:
-    - cron: "17 6 * * *" # daily live proof against mainnet
+    - cron: "17 * * * *" # hourly: catch up to finality, so the watermark never falls behind
   workflow_dispatch:
+
+# Never let two live runs write the same cached database at once.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' && 'live' || github.ref }}
+  cancel-in-progress: false
 
 jobs:
   offline:
@@ -26,37 +31,104 @@ jobs:
     needs: offline
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        chain: [base, ethereum, arbitrum]
+        include:
+          # blocks: first-run / re-anchor lookback. max_blocks: per gated run. max_lag: beyond this,
+          # free RPCs no longer serve the state needed to verify, so skip ahead and record a gap.
+          - { chain: base, blocks: 900, max_blocks: 1800, max_lag: 10800 }
+          - { chain: ethereum, blocks: 150, max_blocks: 600, max_lag: 1800 }
+          # Arbitrum makes ~14,400 blocks an hour and its public RPC only reliably serves ~1,000
+          # blocks of state, so on free endpoints each hourly run verifies a recent window and
+          # records the rest as a gap. Pass an archive RPC with --rpc for full continuity.
+          - { chain: arbitrum, blocks: 800, max_blocks: 4000, max_lag: 1500 }
+    env:
+      DB: chainproof-${{ matrix.chain }}.duckdb
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install -e .
-      # Persist the database between runs so each day continues from yesterday's watermark.
-      - uses: actions/cache@v4
+      # Restore yesterday's database so each run continues from the watermark. It is saved again
+      # even when the gate fails: every publish is atomic, so the file is always consistent.
+      - uses: actions/cache/restore@v4
         with:
-          path: chainproof-${{ matrix.chain }}.duckdb
+          path: ${{ env.DB }}
           key: db-${{ matrix.chain }}-${{ github.run_id }}
           restore-keys: db-${{ matrix.chain }}-
       - name: inspect contract
         run: chainproof inspect --chain ${{ matrix.chain }}
-      - name: index + reconcile (fails the job on any difference)
+      - name: catch up + reconcile (fails the job on any difference)
         run: >
-          chainproof run --chain ${{ matrix.chain }} --db chainproof-${{ matrix.chain }}.duckdb
-          --blocks 300 --max-blocks 1500 --auto-rewind --json run-${{ matrix.chain }}.json
+          chainproof run --chain ${{ matrix.chain }} --db $DB
+          --until-head --time-budget 900
+          --blocks ${{ matrix.blocks }} --max-blocks ${{ matrix.max_blocks }} --max-lag ${{ matrix.max_lag }}
+          --reanchor-on-missing-state --auto-rewind --json run-${{ matrix.chain }}.json
       - name: report
         if: always()
         run: |
-          chainproof status --chain ${{ matrix.chain }} --db chainproof-${{ matrix.chain }}.duckdb >> "$GITHUB_STEP_SUMMARY"
+          chainproof status --chain ${{ matrix.chain }} --db $DB >> "$GITHUB_STEP_SUMMARY"
           echo >> "$GITHUB_STEP_SUMMARY"
-          chainproof report --chain ${{ matrix.chain }} --db chainproof-${{ matrix.chain }}.duckdb >> "$GITHUB_STEP_SUMMARY"
+          chainproof report --chain ${{ matrix.chain }} --db $DB >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: ${{ env.DB }}
+          key: db-${{ matrix.chain }}-${{ github.run_id }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: run-${{ matrix.chain }}
-          path: run-${{ matrix.chain }}.json
+          name: db-${{ matrix.chain }}
+          path: |
+            ${{ env.DB }}
+            run-${{ matrix.chain }}.json
           if-no-files-found: ignore
+          retention-days: 3
+
+  dashboard:
+    name: dashboard
+    needs: live
+    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: db-*
+          merge-multiple: true
+      - name: render
+        run: >
+          chainproof dashboard --out site/index.html
+          --db base=chainproof-base.duckdb --db ethereum=chainproof-ethereum.duckdb --db arbitrum=chainproof-arbitrum.duckdb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dashboard
+          path: site/index.html
+      # Optional: publish to GitHub Pages. Enable Pages with source "GitHub Actions" in the repo
+      # settings, then set the repository variable PAGES_ENABLED=true.
+      - uses: actions/upload-pages-artifact@v3
+        if: vars.PAGES_ENABLED == 'true'
+        with:
+          path: site
+
+  pages:
+    name: publish dashboard
+    needs: dashboard
+    if: always() && needs.dashboard.result == 'success' && vars.PAGES_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

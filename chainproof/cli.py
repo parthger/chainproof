@@ -11,9 +11,9 @@ from datetime import UTC, datetime
 from . import __version__
 from .config import get_chain, get_token
 from .decode import SEL_DECIMALS, SEL_SYMBOL, SEL_TOTAL_SUPPLY, decode_string, decode_uint, format_units
-from .pipeline import ReorgDetected, find_rewind_point, run
+from .pipeline import ReorgDetected, RunReport, find_rewind_point, run, sync
 from .reconcile import ReconciliationError
-from .rpc import RpcClient
+from .rpc import RpcClient, RpcError
 from .store import Store
 
 SLOTS = {
@@ -37,27 +37,61 @@ def _print_checks(checks: list[dict]) -> None:
         print(f"  {mark}  {c['name']:<12} {c['summary']}")
 
 
+def _print_report(rep: RunReport) -> None:
+    if rep.abandoned:
+        print(f"  cleaned  {rep.abandoned} abandoned run(s) from a killed process")
+    if rep.gap is not None:
+        print(f"  GAP      blocks {rep.gap[0]}..{rep.gap[1]} skipped and recorded (state no longer served)")
+    if rep.rewound_to is not None:
+        print(f"  rewound to block {rep.rewound_to} after a reorg")
+    if rep.status == "noop":
+        print(f"  up to date: watermark {rep.start - 1}, finalized head {rep.finalized}")
+        return
+    print(f"  blocks   {rep.start}..{rep.end} ({rep.end - rep.start + 1} blocks, finalized head {rep.finalized})")
+    print(f"  rows     {rep.rows} transfers published   run {rep.run_id}")
+    print(f"  rpc      {rep.extract['requests']} getLogs windows, {rep.extract['splits']} splits, {rep.seconds}s total")
+    _print_checks(rep.checks)
+
+
 def cmd_run(args) -> int:
     chain, token = get_chain(args.chain), get_token(args.chain, args.token)
     reader, verifier = _clients(args)
     store = Store(args.db, decimals=token.decimals)
     print(f"chainproof {__version__}: {token.symbol} on {chain.name}")
     print(f"  primary  {reader.url}\n  verifier {verifier.url}")
+    kw = dict(
+        lookback_blocks=args.blocks,
+        from_block=args.from_block,
+        max_blocks=args.max_blocks,
+        chunk=args.chunk,
+        balance_k=args.holders,
+        canary=not args.no_canary,
+        auto_rewind=args.auto_rewind,
+        max_lag=args.max_lag,
+    )
+    reports: list[RunReport] = []
+
+    def show(rep: RunReport) -> None:
+        reports.append(rep)
+        if args.until_head:
+            print(f"\n  -- run {len(reports)}")
+        _print_report(rep)
+
     try:
-        rep = run(
-            reader,
-            verifier,
-            store,
-            chain,
-            token,
-            lookback_blocks=args.blocks,
-            from_block=args.from_block,
-            max_blocks=args.max_blocks,
-            chunk=args.chunk,
-            balance_k=args.holders,
-            canary=not args.no_canary,
-            auto_rewind=args.auto_rewind,
-        )
+        if args.until_head:
+            sync(
+                reader,
+                verifier,
+                store,
+                chain,
+                token,
+                time_budget=args.time_budget,
+                reanchor_on_missing_state=args.reanchor_on_missing_state,
+                on_report=show,
+                **kw,
+            )
+        else:
+            show(run(reader, verifier, store, chain, token, **kw))
     except ReconciliationError as e:
         print(f"\n{e}", file=sys.stderr)
         _print_checks([c.__dict__ for c in e.results])
@@ -65,18 +99,19 @@ def cmd_run(args) -> int:
     except ReorgDetected as e:
         print(f"\nREORG TRIPWIRE: {e}", file=sys.stderr)
         return 3
-    if rep.status == "noop":
-        print(f"  up to date: watermark is at the finalized head ({rep.finalized})")
-        return 0
-    if rep.rewound_to is not None:
-        print(f"  rewound to block {rep.rewound_to} after a reorg")
-    print(f"  blocks   {rep.start}..{rep.end} ({rep.end - rep.start + 1} blocks, finalized head {rep.finalized})")
-    print(f"  rows     {rep.rows} transfers published   run {rep.run_id}")
-    print(f"  rpc      {rep.extract['requests']} getLogs windows, {rep.extract['splits']} splits, {rep.seconds}s total")
-    _print_checks(rep.checks)
-    if args.json:
-        with open(args.json, "w") as f:
-            json.dump(rep.__dict__, f, indent=2, default=str)
+    except RpcError as e:
+        print(f"\nRPC FAILURE: {type(e).__name__}: {str(e)[:400]}", file=sys.stderr)
+        return 4
+    finally:
+        if args.json and reports:
+            with open(args.json, "w") as f:
+                json.dump([r.__dict__ for r in reports], f, indent=2, default=str)
+    if args.until_head:
+        published = [r for r in reports if r.status == "published"]
+        rows = sum(r.rows for r in published)
+        last = reports[-1]
+        state = "caught up" if last.status == "noop" else "time budget reached, will continue next run"
+        print(f"\n  total    {len(published)} published run(s), {rows} transfers; {state}")
     return 0
 
 
@@ -87,6 +122,11 @@ def cmd_status(args) -> int:
     print(f"{token.symbol} on {chain.name}")
     print(f"  watermark  {wm[0] if wm else '-'}  {wm[1] if wm else ''}")
     print(f"  published  {store.published_count(chain.chain_id, token.address)} transfers")
+    gaps = store.gaps(chain.chain_id, token.address)
+    if gaps:
+        print(f"  gaps       {len(gaps)} recorded:")
+        for g0, g1, why, _at in gaps:
+            print(f"    {g0}..{g1}  {why[:90]}")
     print("  recent runs:")
     for run_id, _cid, _tok, s, e, status, n, err, _checks in store.runs(10):
         line = f"    {run_id}  {s}..{e}  {status:<9} rows={n}"
@@ -145,6 +185,20 @@ def cmd_inspect(args) -> int:
     return 0
 
 
+def cmd_dashboard(args) -> int:
+    from .dashboard import render
+
+    sources = []
+    for item in args.db:
+        name, _, path = item.partition("=")
+        if not path:
+            raise SystemExit(f"--db expects CHAIN=PATH, got {item!r}")
+        sources.append((get_chain(name), get_token(name, args.token), path))
+    out = render(sources, args.out, hours=args.hours)
+    print(f"wrote {out}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="chainproof", description=__doc__)
     p.add_argument("--version", action="version", version=__version__)
@@ -168,8 +222,23 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--holders", type=int, default=10, help="busy holders to check with balanceOf (plus as many random)")
     r.add_argument("--no-canary", action="store_true", help="skip the planted-fault self-test")
     r.add_argument("--auto-rewind", action="store_true", help="on a reorg tripwire, rewind and continue")
-    r.add_argument("--json", help="write the run report to this file")
+    r.add_argument("--until-head", action="store_true", help="catch-up mode: keep running gated ranges until finality")
+    r.add_argument("--time-budget", type=float, default=900.0, help="catch-up mode: stop starting new runs after N seconds")
+    r.add_argument("--max-lag", type=int, help="if the watermark is more than N blocks behind, skip ahead and record a gap")
+    r.add_argument(
+        "--reanchor-on-missing-state",
+        action="store_true",
+        help="catch-up mode: if the RPC has pruned the state at the range start, skip ahead once and record a gap",
+    )
+    r.add_argument("--json", help="write the run report(s) to this file")
     r.set_defaults(func=cmd_run)
+
+    d = sub.add_parser("dashboard", help="render a self-contained HTML dashboard from one or more databases")
+    d.add_argument("--db", action="append", required=True, metavar="CHAIN=PATH", help="e.g. base=chainproof-base.duckdb")
+    d.add_argument("--token", default="USDC")
+    d.add_argument("--out", default="dashboard/index.html")
+    d.add_argument("--hours", type=int, default=24, help="window for the headline numbers and the hourly chart")
+    d.set_defaults(func=cmd_dashboard)
 
     s = sub.add_parser("status", help="watermark and recent runs")
     common(s, rpc=False)

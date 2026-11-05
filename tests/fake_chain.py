@@ -216,11 +216,13 @@ class FaultyReader:
         drop_every: int = 0,
         bump_amount_at: int | None = None,
         strip_timestamps: bool = False,
+        zero_timestamps: bool = False,
     ) -> None:
         self.inner = inner
         self.drop_every = drop_every
         self.bump_amount_at = bump_amount_at
         self.strip_timestamps = strip_timestamps
+        self.zero_timestamps = zero_timestamps
 
     def __getattr__(self, name):
         return getattr(self.inner, name)
@@ -236,5 +238,7 @@ class FaultyReader:
                 lg["data"] = "0x" + f"{int(lg['data'], 16) + 1:064x}"
             if self.strip_timestamps:
                 lg.pop("blockTimestamp", None)
+            if self.zero_timestamps:
+                lg["blockTimestamp"] = "0x0"  # what arb1 actually sends
             out.append(lg)
         return out

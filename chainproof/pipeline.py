@@ -20,7 +20,7 @@ from dataclasses import asdict, dataclass, field
 from .config import Chain, Token
 from .extract import ExtractStats, extract_transfers
 from .reconcile import CheckResult, Evidence, ReconciliationError, gate, gather_evidence
-from .rpc import ChainReader
+from .rpc import ChainReader, StateUnavailable
 from .store import Store
 
 log = logging.getLogger(__name__)
@@ -49,6 +49,8 @@ class RunReport:
     seconds: float = 0.0
     evidence: dict = field(default_factory=dict)
     rewound_to: int | None = None
+    gap: tuple[int, int] | None = None
+    abandoned: int = 0
 
 
 def find_rewind_point(store: Store, reader: ChainReader, chain_id: int, token: str) -> tuple[int, str]:
@@ -57,6 +59,59 @@ def find_rewind_point(store: Store, reader: ChainReader, chain_id: int, token: s
         if reader.block_hash(number) == stored:
             return number, stored
     raise ReorgDetected("no stored block in the last 256 is canonical; rewind manually with `chainproof rewind`")
+
+
+def reanchor(
+    store: Store, reader: ChainReader, chain: Chain, token: Token, finalized: int, lookback_blocks: int, why: str
+) -> tuple[int, int] | None:
+    """Move the watermark to finalized - lookback and record the skipped blocks as a gap."""
+    to_block = finalized - lookback_blocks
+    gap = store.reanchor(chain.chain_id, token.address, to_block, reader.block_hash(to_block), why)
+    if gap:
+        log.warning("re-anchored: blocks %d..%d recorded as a gap (%s)", gap[0], gap[1], why)
+    return gap
+
+
+def sync(
+    reader: ChainReader,
+    verifier: ChainReader,
+    store: Store,
+    chain: Chain,
+    token: Token,
+    *,
+    time_budget: float = 900.0,
+    max_runs: int = 100,
+    reanchor_on_missing_state: bool = False,
+    on_report=None,
+    **kw,
+) -> list[RunReport]:
+    """Catch-up mode: run gated ranges back to back until the watermark reaches finality.
+
+    Stops at the first failure (a failed gate must never be skipped over), when the time
+    budget is spent, or after `max_runs`. Each run is still all-or-nothing.
+    """
+    t0 = time.monotonic()
+    reports: list[RunReport] = []
+    reanchored = False
+    while len(reports) < max_runs and time.monotonic() - t0 < time_budget:
+        try:
+            rep = run(reader, verifier, store, chain, token, **kw)
+        except StateUnavailable as e:
+            # The range start is older than the node keeps state for. Verifying it is impossible
+            # on this endpoint; skip ahead once, explicitly, and keep going.
+            if not reanchor_on_missing_state or reanchored:
+                raise
+            fin = min(reader.finalized_block()[0], verifier.finalized_block()[0])
+            reanchor(store, reader, chain, token, fin, kw.get("lookback_blocks", 1_000), f"state unavailable: {e}"[:300])
+            reanchored = True
+            continue
+        reports.append(rep)
+        if on_report:
+            on_report(rep)
+        if rep.status == "noop":
+            break
+        kw.pop("from_block", None)  # only meaningful for the very first run
+    return reports
 
 
 def run(
@@ -73,9 +128,23 @@ def run(
     balance_k: int = 10,
     canary: bool = True,
     auto_rewind: bool = False,
+    max_lag: int | None = None,
 ) -> RunReport:
+    """One gated run. `max_lag`: if the watermark is more than this many blocks behind finality,
+    skip ahead to the last `lookback_blocks` and record the skipped range as a gap. Public RPCs
+    prune old state, so a range that starts too far back can no longer be verified at all."""
     t0 = time.monotonic()
     addr = token.address
+    abandoned = store.abandon_stale_runs(chain.chain_id, addr)
+    if abandoned:
+        log.warning("marked %d stale staged run(s) as abandoned", abandoned)
+    bad = store.bad_time_blocks(chain.chain_id, addr)
+    if bad:
+        times: dict[int, int] = {}
+        for i in range(0, len(bad), 200):
+            times.update(reader.block_timestamps(bad[i : i + 200]))
+        fixed = store.repair_block_times(chain.chain_id, addr, times)
+        log.warning("repaired block_time on %d published rows in %d blocks", fixed, len(bad))
 
     for name, r in (("primary", reader), ("verifier", verifier)):
         cid = r.chain_id()
@@ -87,6 +156,7 @@ def run(
     finalized = min(fin_a, fin_b)  # both sources must agree the range is final
 
     rewound_to = None
+    gap = None
     wm = store.watermark(chain.chain_id, addr)
     if wm is not None:
         wm_block, wm_hash = wm
@@ -102,17 +172,20 @@ def run(
             deleted = store.rewind(chain.chain_id, addr, to_block, to_hash)
             log.warning("reorg: rewound to block %d, deleted %d rows", to_block, deleted)
             rewound_to, wm_block = to_block, to_block
+        if max_lag is not None and finalized - wm_block > max_lag:
+            gap = reanchor(store, reader, chain, token, finalized, lookback_blocks, f"lag {finalized - wm_block} > {max_lag}")
+            wm_block = finalized - lookback_blocks
         start = wm_block + 1
     else:
         start = from_block if from_block is not None else finalized - lookback_blocks + 1
 
     end = min(finalized, start + max_blocks - 1)
-    report = RunReport(None, chain.name, token.symbol, start, end, finalized, rewound_to=rewound_to)
+    report = RunReport(None, chain.name, token.symbol, start, end, finalized, rewound_to=rewound_to, gap=gap, abandoned=abandoned)
     if end < start:
         report.seconds = time.monotonic() - t0
         return report
 
-    run_id = store.begin_run(chain.chain_id, addr, start, end)
+    run_id = store.begin_run(chain.chain_id, addr, start, end, finalized)
     report.run_id = run_id
     results: list[CheckResult] = []
     stats = ExtractStats()

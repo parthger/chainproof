@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 import pytest
 
 from chainproof.config import Chain, Token
-from chainproof.decode import ZERO_ADDRESS
+from chainproof.decode import ZERO_ADDRESS, Transfer
 from chainproof.extract import ExtractError, extract_transfers, fetch_logs
 from chainproof.pipeline import ReorgDetected, run
 from chainproof.reconcile import ReconciliationError, evaluate, gather_evidence, plant_fault
@@ -61,6 +61,7 @@ def test_happy_path_publishes_and_resumes():
         "supply": True,
         "balances": True,
         "canonical": True,
+        "timestamps": True,
         "decimals": True,
         "canary": True,
     }
@@ -251,3 +252,193 @@ def test_canary_mutation_is_detected():
     mutated, _ = plant_fault(rows, ev)
     assert not all(c.passed for c in evaluate(mutated, ev))
     assert all(c.passed for c in evaluate(rows, ev))
+
+
+# ---- regressions found on 2026-11-05 ---------------------------------------
+
+
+def test_canary_never_picks_a_self_transfer():
+    from chainproof.reconcile import Evidence, run_canary
+
+    a, b, h = "0x" + "a" * 40, "0x" + "b" * 40, "0x" + "1" * 64
+    rows = [
+        Transfer(1, 10, h, 0, h, TOKEN, a, b, 5),
+        Transfer(1, 10, h, 1, h, TOKEN, a, a, 1_000_000),  # largest row, but a self-transfer
+    ]
+    vrows = {t.key: (t.tx_hash, t.from_address, t.to_address, t.amount_raw) for t in rows}
+    ev = Evidence(10, 10, 6, 6, 100, 100, [a, b], {a: 50, b: 0}, {a: 45, b: 5}, {10: h}, {}, vrows)
+    assert all(c.passed for c in evaluate(rows, ev))
+    canary = run_canary(rows, ev)
+    assert canary.passed, canary.summary
+    assert "log 0" in canary.summary
+
+
+def test_staging_enforces_the_same_constraints_as_published():
+    import duckdb
+
+    store = Store()
+    run_id = store.begin_run(8453, TOKEN, 1, 1)
+    with pytest.raises(duckdb.ConstraintException):
+        store.con.execute(
+            "INSERT INTO staging_transfers VALUES (8453, 1, 0, ?, now()::TIMESTAMP, ?, ?, ?, ?, '12a', 0, ?)",
+            ["0x" + "1" * 64, "0x" + "2" * 64, TOKEN, TOKEN, TOKEN, run_id],
+        )
+
+
+def test_old_unconstrained_staging_table_is_migrated(tmp_path):
+    import duckdb
+
+    db = tmp_path / "old.duckdb"
+    Store(db).close()
+    con = duckdb.connect(str(db))
+    con.execute("DROP TABLE staging_transfers")
+    con.execute("CREATE TABLE staging_transfers AS SELECT * FROM transfers WHERE false")  # 0.1.0 DDL
+    con.close()
+    store = Store(db)
+    n = store.con.execute(
+        "SELECT count(*) FROM duckdb_constraints() WHERE table_name = 'staging_transfers' AND constraint_type = 'CHECK'"
+    ).fetchone()[0]
+    assert n > 0
+
+
+def test_killed_run_is_abandoned_and_cleaned_up():
+    chain = FakeChain()
+    store = Store()
+    rows = extract_transfers(chain, 8453, TOKEN, chain.first, chain.first + 20)
+    dead = store.begin_run(8453, TOKEN, chain.first, chain.first + 20)
+    store.stage(dead, rows)  # ...and then the process is killed
+    r = _run(chain, chain, store)
+    assert r.status == "published" and r.abandoned == 1
+    status = dict(store.con.execute("SELECT run_id, status FROM runs").fetchall())
+    assert status[dead] == "abandoned"
+    assert store.con.execute("SELECT count(*) FROM staging_transfers").fetchone()[0] == 0
+
+
+# ---- catch-up mode and re-anchoring ----------------------------------------
+
+
+def test_sync_catches_up_to_finality_in_gated_steps():
+    from chainproof.pipeline import sync
+
+    chain = FakeChain(n_blocks=400)
+    store = Store()
+    reps = sync(chain, chain, store, CHAIN, USDC, from_block=chain.first, max_blocks=100, chunk=25)
+    fin, _ = chain.finalized_block()
+    assert [r.status for r in reps][-1] == "noop"
+    assert all(r.status == "published" for r in reps[:-1]) and len(reps) >= 4
+    assert store.watermark(CHAIN.chain_id, TOKEN)[0] == fin
+    assert _mart(store) == _expected_daily(store)
+
+
+def test_sync_stops_at_the_first_failed_gate():
+    from chainproof.pipeline import sync
+
+    chain = FakeChain(n_blocks=400)
+    store = Store()
+    with pytest.raises(ReconciliationError):
+        sync(FaultyReader(chain, drop_every=7), chain, store, CHAIN, USDC, from_block=chain.first, max_blocks=100)
+    assert store.watermark(CHAIN.chain_id, TOKEN) is None
+
+
+def test_max_lag_reanchors_and_records_the_gap():
+    chain = FakeChain(n_blocks=400)
+    store = Store()
+    r1 = _run(chain, chain, store, max_blocks=50)
+    chain.advance(200)
+    r2 = _run(chain, chain, store, max_lag=100, lookback_blocks=30, max_blocks=1_000)
+    fin, _ = chain.finalized_block()
+    assert r2.gap == (r1.end + 1, fin - 30)
+    assert r2.start == fin - 29 and r2.status == "published"
+    assert store.gaps(CHAIN.chain_id, TOKEN)[0][:2] == (r1.end + 1, fin - 30)
+
+
+def test_missing_state_reanchors_once_in_sync():
+    from chainproof.pipeline import sync
+    from chainproof.rpc import StateUnavailable
+
+    class Pruned(FaultyReader):
+        """State older than `keep` blocks behind the head is gone, like a public full node."""
+
+        def call_many(self, calls, block):
+            if block < self.inner.head - 150:
+                raise StateUnavailable(f"historical state for {block} is not available")
+            return self.inner.call_many(calls, block)
+
+    chain = FakeChain(n_blocks=400)
+    store = Store()
+    _run(chain, chain, store, max_blocks=50)
+    chain.advance(300)
+    pruned = Pruned(chain)
+    reps = sync(pruned, pruned, store, CHAIN, USDC, max_blocks=1_000, lookback_blocks=40, reanchor_on_missing_state=True)
+    assert reps[-1].status == "noop" and reps[0].status == "published"
+    assert len(store.gaps(CHAIN.chain_id, TOKEN)) == 1
+    assert store.con.execute("SELECT count(*) FROM runs WHERE status = 'failed'").fetchone()[0] == 1
+
+
+# ---- dashboard -----------------------------------------------------------------
+
+
+def test_dashboard_renders_pass_fail_and_gaps(tmp_path):
+    from chainproof.dashboard import render
+
+    good_db, bad_db = tmp_path / "good.duckdb", tmp_path / "bad.duckdb"
+    chain = FakeChain(n_blocks=400)
+    good = Store(good_db)
+    _run(chain, chain, good, max_blocks=100)
+    chain.advance(200)
+    _run(chain, chain, good, max_lag=100, lookback_blocks=30, max_blocks=1_000)  # records a gap
+    good.close()
+    bad = Store(bad_db)
+    with pytest.raises(ReconciliationError):
+        _run(FaultyReader(chain, drop_every=7), chain, bad)
+    bad.close()
+
+    # the fake chain lives in Oct 2025: render "as of" just after its last block
+    last = datetime.fromtimestamp(chain.blocks[chain.head].timestamp, UTC)
+    out = render([(CHAIN, USDC, str(good_db)), (CHAIN, USDC, str(bad_db))], tmp_path / "d.html", now=last)
+    page = out.read_text()
+    assert "All checks passing" in page and "Latest run failed" in page
+    assert "1 of 2 chains failing" in page
+    assert "Gap recorded" in page
+    assert page.count('class="bar"') > 0 and "<script" in page and "http" not in page.split("<script>")[1]
+
+
+# ---- timestamps (arb1 sends blockTimestamp "0x0") ------------------------------
+
+
+def test_zero_block_timestamp_is_backfilled_not_stored_as_1970():
+    chain = FakeChain(n_blocks=40)
+    store = Store()
+    r = _run(FaultyReader(chain, zero_timestamps=True), chain, store, max_blocks=1_000)
+    assert r.status == "published"
+    first = store.con.execute("SELECT min(block_time) FROM transfers").fetchone()[0]
+    assert first.year == 2025
+    assert {c["name"]: c["passed"] for c in r.checks}["timestamps"]
+
+
+def test_wrong_block_time_fails_the_timestamps_check():
+    chain = FakeChain()
+    rows = extract_transfers(chain, 8453, TOKEN, chain.first + 1, chain.first + 100)
+    ev = gather_evidence(chain, chain, USDC, 8453, rows, chain.first + 1, chain.first + 100)
+    b = next(iter(ev.canonical_times))
+    shifted = [t if t.block_number != b else Transfer(**{**t.__dict__, "block_time": t.block_time + 3600}) for t in rows]
+    result = {c.name: c.passed for c in evaluate(shifted, ev)}
+    assert result["timestamps"] is False
+    assert result["completeness"] is True  # completeness compares amounts and addresses, not times
+
+
+def test_1970_rows_from_an_old_database_are_repaired_on_the_next_run():
+    chain = FakeChain(n_blocks=200)
+    store = Store()
+    _run(chain, chain, store, max_blocks=60)
+    # simulate a 0.1.0 database: arb1's "0x0" stored as 1970 (no CHECK on old tables)
+    store.con.execute("ALTER TABLE transfers RENAME TO t_old")
+    store.con.execute("CREATE TABLE transfers AS SELECT * FROM t_old")
+    store.con.execute("DROP TABLE t_old")
+    store.con.execute("UPDATE transfers SET block_time = TIMESTAMP '1970-01-01' WHERE block_number < ?", [chain.first + 30])
+    store._rebuild_days(CHAIN.chain_id, TOKEN, [datetime(1970, 1, 1).date()])
+    assert datetime(1970, 1, 1).date() in _mart(store)
+    _run(chain, chain, store, max_blocks=60)
+    assert store.bad_time_blocks(CHAIN.chain_id, TOKEN) == []
+    assert datetime(1970, 1, 1).date() not in _mart(store)
+    assert _mart(store) == _expected_daily(store)

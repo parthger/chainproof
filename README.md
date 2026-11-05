@@ -32,6 +32,8 @@ chainproof 0.1.0: USDC on base
 
 The supply check is exact to the raw unit: `totalSupply(end) − totalSupply(start−1)` equals `Σ mints − Σ burns`, and 20 holders' `balanceOf` deltas equal their net flows. A planted one-unit fault is caught on every run.
 
+The Arbitrum row's amounts were correct, but 0.1.0 stored its block times as 1970-01-01 (lesson 7 below). The `timestamps` check now guards that, and existing databases are repaired on the next run.
+
 ## How it works
 
 ```mermaid
@@ -55,6 +57,7 @@ flowchart LR
 | `supply` | `Δ totalSupply` vs `mints − burns` | missed or double-counted mints and burns, supply changes without a `Transfer` |
 | `balances` | `Δ balanceOf` for 10 busiest + 10 random holders vs their net flow | wrong amounts, swapped from/to, wrong decimals |
 | `canonical` | stored block hashes vs the chain | rows from orphaned (reorged) blocks |
+| `timestamps` | stored `block_time` vs the verifier's block timestamp, on sampled blocks | placeholder or wrong times, rows landing on the wrong day |
 | `decimals` | `decimals()` on-chain vs config | wrong token, wrong units |
 | `canary` | adds +1 raw unit to one staged row and re-runs the checks | a gate that can't fail |
 
@@ -68,6 +71,8 @@ One invariant is never enough. A holder-to-holder transfer with a wrong amount d
 - **Stage, verify, publish.** The gate reads the *stored* rows back, so it checks what's in the database, not what the code meant to write.
 - **Daily mart replaces whole days.** It never merges by key. After a rewind, a day that lost all its rows loses its mart row too. A key-based merge would leave a ghost row.
 - **Failures are classified.** "Range too large" halves the `eth_getLogs` window. "Endpoint unhealthy" backs off. "Batch too large" shrinks the JSON-RPC batch. Each was learned from a real provider (below).
+- **Catch up, never skip silently.** `--until-head` runs gated ranges back to back until the watermark reaches finality, stopping at the first failure. If the watermark falls so far behind that the RPC no longer serves the state needed to verify a range, the run skips ahead and records the skipped blocks in a `gaps` table. `status` and the dashboard show every gap.
+- **Self-healing state.** A process killed mid-run leaves its run marked `abandoned` and its staged rows deleted on the next start. Rows published with an impossible `block_time` are re-timed from the chain, and the affected days of the mart are rebuilt.
 - **Malformed data fails loudly.** An address topic with non-zero padding, a short data word, or a `removed: true` log raises instead of being read as a plausible-looking wrong value.
 
 ### Things the public RPCs taught me while building this
@@ -77,6 +82,10 @@ One invariant is never enough. A holder-to-holder transfer with a wrong amount d
 3. `mainnet.base.org` rate-limits after a few dozen requests. The independent verifier is publicnode.
 4. Arbitrum's *finalized* block trails the head by thousands of blocks, so free endpoints treat a read at finality as an **archive request**. State reads use `arb1.arbitrum.io`.
 5. USDC keeps its implementation address in the **legacy zeppelinos slot**. The EIP-1967 slot is empty, so a tool that only reads EIP-1967 would call USDC "not a proxy". See `chainproof inspect` and [docs/spec-usdc.md](docs/spec-usdc.md).
+6. In November 2026 drpc started rejecting batches over 3 requests with **HTTP 400** instead of 500. Batch errors are now recognized by their body under any status code.
+7. `arb1.arbitrum.io` returns `"blockTimestamp": "0x0"` on logs instead of omitting the field. 0.1.0 stored those transfers as **1970-01-01**, and no check noticed, because none looked at time. The `timestamps` check exists because of this, and old databases are repaired on the next run.
+8. `arb1.arbitrum.io` load-balances across nodes that keep different amounts of history. The same `eth_call` at 2,400 blocks behind finality succeeds on one request and fails with "historical state is not available" on the next. Pruned-state errors are retried before they count.
+9. A 429 body says "Too Many Requests" or "rate limit exceeded". Both contain words that look like a range error ("too many", "exceed"). Rate limits are classified first, and always back off.
 
 ## Quickstart
 
@@ -88,17 +97,28 @@ pip install -e '.[dev]'
 chainproof inspect --chain base                 # research pass: decimals, supply, proxy slots
 chainproof run --chain base --blocks 300        # index + reconcile the last 300 finalized blocks
 chainproof run --chain base                     # continue from the watermark
+chainproof run --chain base --until-head        # catch-up mode: gated runs until finality
 chainproof status --chain base                  # watermark and run log (failed runs included)
 chainproof report --chain base                  # daily mart as markdown
+chainproof dashboard --db base=chainproof.duckdb   # self-contained HTML dashboard
 chainproof run --chain ethereum --blocks 100    # also: arbitrum
 ```
 
-Useful flags: `--rpc` / `--verify-rpc` to bring your own endpoints, `--auto-rewind` to heal after a reorg tripwire, `--holders N` for more balance checks, `--json report.json` for the run report.
+Useful flags: `--rpc` / `--verify-rpc` to bring your own endpoints, `--auto-rewind` to heal after a reorg tripwire, `--max-lag N` and `--reanchor-on-missing-state` to skip ahead (with a recorded gap) when old state is pruned, `--holders N` for more balance checks, `--json report.json` for the run report.
+
+## Dashboard
+
+`chainproof dashboard` renders one HTML file from one or more databases: per chain, the latest verdict, every check, the last 24 hours of verified transfers, volume and net supply change (exact to the raw unit), data freshness, the hourly transfer chart and any recorded gaps. It has no external scripts or fonts. Append `#light` or `#dark` to the URL to pick the theme for a screenshot.
+
+```bash
+chainproof dashboard --out dashboard/index.html \
+  --db base=chainproof-base.duckdb --db ethereum=chainproof-ethereum.duckdb --db arbitrum=chainproof-arbitrum.duckdb
+```
 
 ## Tests
 
 ```bash
-pytest   # 30 tests, ~1.5 s, no network
+pytest   # 48 tests, ~3 s, no network
 ```
 
 The suite runs the real pipeline against `tests/fake_chain.py`, an in-memory chain with real log shapes, state at every block, and controllable faults. That covers what a public RPC never lets you force:
@@ -115,8 +135,14 @@ The suite runs the real pipeline against `tests/fake_chain.py`, an in-memory cha
 | rewind past midnight | the emptied day disappears from the mart |
 | provider caps range at 17 blocks | adaptive window returns identical rows |
 | drpc-style HTTP 400 / 429 / 500-batch errors | classified correctly; range errors not retried |
+| 429 "Too Many Requests", HTTP 400 batch errors | backed off, batch shrinks to exactly 3 |
+| `blockTimestamp: "0x0"` from the provider | real time backfilled; a wrong time fails `timestamps` |
+| 1970 rows in an old database | repaired on the next run, mart days rebuilt |
+| largest canary candidate is a self-transfer | skipped; the canary still turns the gate red |
+| killed run left in staging | marked abandoned, staged rows removed |
+| catch-up across many ranges, or state pruned | gated run by run; skipped blocks recorded as a gap |
 
-CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs lint and tests on every push. A daily scheduled job runs the live gate on Base, Ethereum and Arbitrum, continuing from a cached watermark, and fails on any difference.
+CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs lint and tests on every push. An hourly scheduled job catches each chain up to finality from a cached watermark, fails on any difference, and renders the dashboard as a build artifact. To publish the dashboard on GitHub Pages, set Pages to deploy from GitHub Actions and add the repository variable `PAGES_ENABLED=true`.
 
 ## Layout
 
@@ -128,10 +154,11 @@ chainproof/
   reconcile.py  evidence gathering (chain reads) + pure checks + canary
   store.py      DuckDB schema, staging, atomic publish, watermark, rewind, daily mart
   pipeline.py   one run, end to end
-  cli.py        run | status | report | rewind | inspect
+  dashboard.py  self-contained HTML dashboard from the run log and published tables
+  cli.py        run | status | report | rewind | inspect | dashboard
 docs/
   spec-usdc.md  indexing spec written before the code
-tests/          fake chain + 30 tests
+tests/          fake chain + 48 tests
 ```
 
 ## Limitations
@@ -140,6 +167,7 @@ tests/          fake chain + 30 tests
 - Balance checks sample 20 holders per run, not all of them. `completeness` is the full-coverage check.
 - RPC-based backfill is fine for hours to days of history. For months, swap the extractor for a bulk source (cryo, HyperSync, SQD Portal) and keep the gate.
 - Finalized-only means latency equals finality: seconds on Base, ~13 min on Ethereum.
+- On free RPCs, Arbitrum cannot be verified continuously from an hourly job. It produces ~14,400 blocks an hour, and its public endpoint reliably serves only ~1,000 blocks of state. Each run verifies a recent window and records the rest as a gap. Pass an archive endpoint with `--rpc` for full coverage.
 
 ## Credit
 

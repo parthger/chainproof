@@ -47,6 +47,10 @@ class EndpointUnhealthy(RpcError):
     """Retries were exhausted on transient failures."""
 
 
+class StateUnavailable(RpcError):
+    """The node has pruned the state at that block. Reading it needs an archive node."""
+
+
 class ChainReader(Protocol):
     """Everything the pipeline needs from a chain. RpcClient and the test FakeChain both implement it."""
 
@@ -58,9 +62,31 @@ class ChainReader(Protocol):
     def block_timestamps(self, numbers: list[int]) -> dict[int, int]: ...
 
 
+# Rate limits must be checked BEFORE range hints: "Too Many Requests" and "rate limit exceeded"
+# contain "too many" and "exceed", and halving a range never fixes a rate limit.
+_RATE_HINTS = ("rate limit", "too many requests", "request limit", "throttl", "capacity", "slow down")
+_STATE_HINTS = ("historical state", "missing trie node", "state is not available", "state not available", "pruned")
+
+
+def _looks_like_rate_limit(message: str) -> bool:
+    m = message.lower()
+    return any(h in m for h in _RATE_HINTS)
+
+
 def _looks_like_range_error(message: str) -> bool:
     m = message.lower()
+    if _looks_like_rate_limit(m):
+        return False
     return any(h in m for h in _RANGE_HINTS)
+
+
+def _looks_like_batch_limit(message: str) -> bool:
+    m = message.lower()
+    return "batch" in m and any(h in m for h in ("not allowed", "too large", "more than", "exceed", "limit"))
+
+
+class _Retryable(Exception):
+    """Internal: a JSON-RPC level rate limit that should be retried like a 429."""
 
 
 class RpcClient:
@@ -91,9 +117,11 @@ class RpcClient:
             try:
                 self.requests_made += 1
                 r = self.session.post(self.url, json=payload, timeout=self.timeout)
-                if r.status_code == 429 or r.status_code >= 500:
+                if r.status_code == 429:
+                    raise requests.HTTPError(f"HTTP 429: {r.text[:300]}")  # always back off, never shrink
+                if r.status_code >= 500:
                     body = r.text[:300]
-                    if "batch" in body.lower() and ("not allowed" in body.lower() or "too large" in body.lower()):
+                    if _looks_like_batch_limit(body):
                         raise BatchTooLarge(body)
                     if _looks_like_range_error(body):
                         raise RangeTooLarge(body)
@@ -101,25 +129,42 @@ class RpcClient:
                 if r.status_code == 413:
                     raise RangeTooLarge("HTTP 413 payload too large")
                 if 400 <= r.status_code < 500:
-                    # Some providers send JSON-RPC errors with a 4xx status (drpc answers a
-                    # 200-block getLogs with HTTP 400 "ranges over 10000 blocks are not supported").
-                    # Retrying will never help: hand the error body to _unwrap for classification.
+                    # Some providers send JSON-RPC errors with a 4xx status: drpc answers a 200-block
+                    # getLogs with HTTP 400 "ranges over 10000 blocks", and (since Nov 2026) an
+                    # oversized batch with HTTP 400 and one error per item. Retrying never helps:
+                    # hand the JSON body back for classification by _unwrap / _batch_once.
                     try:
                         body = r.json()
                     except ValueError:
                         raise RpcError(f"HTTP {r.status_code}: {r.text[:300]}") from None
+                    if self._is_rate_limited(body):
+                        raise _Retryable(str(body)[:300])
                     if isinstance(body, dict) and body.get("error"):
+                        return body
+                    if isinstance(body, list) and body and all(isinstance(x, dict) and x.get("error") for x in body):
                         return body
                     raise RpcError(f"HTTP {r.status_code}: {r.text[:300]}")
                 r.raise_for_status()
-                return r.json()
+                body = r.json()
+                if self._is_rate_limited(body):
+                    raise _Retryable(str(body)[:300])
+                return body
             except (RangeTooLarge, BatchTooLarge):
                 raise
-            except (requests.ConnectionError, requests.Timeout, requests.HTTPError, ValueError) as e:
+            except (requests.ConnectionError, requests.Timeout, requests.HTTPError, ValueError, _Retryable) as e:
                 last = e
                 sleep = self.backoff_base * (2**attempt) * (1 + random.random() * 0.25)
                 time.sleep(sleep)
         raise EndpointUnhealthy(f"{self.url}: gave up after {self.max_retries} attempts: {last}")
+
+    @staticmethod
+    def _is_rate_limited(body: Any) -> bool:
+        """A 200 response whose JSON-RPC error (or every batch item's error) is a rate limit."""
+        items = body if isinstance(body, list) else [body]
+        errs = [x.get("error") for x in items if isinstance(x, dict)]
+        if not errs or not all(errs):
+            return False
+        return all(_looks_like_rate_limit(f"{e.get('code')} {e.get('message')}") for e in errs if isinstance(e, dict))
 
     def _next_id(self) -> int:
         self._id += 1
@@ -132,6 +177,8 @@ class RpcClient:
             msg = f"{err.get('code')}: {err.get('message')} {err.get('data') or ''}".strip()
             if _looks_like_range_error(msg):
                 raise RangeTooLarge(msg)
+            if any(h in msg.lower() for h in _STATE_HINTS):
+                raise StateUnavailable(msg)
             raise RpcError(msg)
         return resp["result"]
 
@@ -153,7 +200,9 @@ class RpcClient:
             except BatchTooLarge:
                 if self.batch_size == 1:
                     raise
-                self.batch_size = max(1, self.batch_size // 2 if self.batch_size > 3 else 1)
+                # 20 -> 10 -> 5 -> 3 -> 1: stop at 3 on the way down, the free-tier cap we have seen most
+                half = self.batch_size // 2
+                self.batch_size = half if half >= 3 else (3 if self.batch_size > 3 else 1)
                 continue
             i += len(part)
         return out
@@ -165,6 +214,9 @@ class RpcClient:
         resp = self._post(payload)
         if not isinstance(resp, list):
             # some providers answer a batch with a single error object
+            err = resp.get("error") if isinstance(resp, dict) else None
+            if err and _looks_like_batch_limit(str(err)):
+                raise BatchTooLarge(str(err))
             self._unwrap(resp)
             raise RpcError(f"expected a batch response, got {str(resp)[:200]}")
         by_id = {r.get("id"): r for r in resp}
@@ -172,7 +224,7 @@ class RpcClient:
             if rid not in by_id:
                 raise RpcError(f"batch response missing id {rid}")
             err = by_id[rid].get("error") or {}
-            if "batch" in str(err.get("message", "")).lower():
+            if _looks_like_batch_limit(str(err.get("message", ""))):
                 raise BatchTooLarge(str(err))
             out.append(self._unwrap(by_id[rid]))
         return out
@@ -200,9 +252,18 @@ class RpcClient:
             [{"address": address, "topics": [topic0], "fromBlock": hex(from_block), "toBlock": hex(to_block)}],
         )
 
-    def call_many(self, calls: list[tuple[str, str]], block: int) -> list[str]:
+    def call_many(self, calls: list[tuple[str, str]], block: int, state_retries: int = 4) -> list[str]:
+        """eth_call at a pinned block. Pruned-state errors are retried: public endpoints load-balance
+        across nodes that keep different amounts of history (arb1 answers the same block both ways)."""
         tag = hex(block)
-        return self.batch([("eth_call", [{"to": to, "data": data}, tag]) for to, data in calls])
+        for attempt in range(state_retries):
+            try:
+                return self.batch([("eth_call", [{"to": to, "data": data}, tag]) for to, data in calls])
+            except StateUnavailable:
+                if attempt == state_retries - 1:
+                    raise
+                time.sleep(self.backoff_base * 0.5 * (2**attempt))
+        raise AssertionError("unreachable")
 
     def block_timestamps(self, numbers: list[int]) -> dict[int, int]:
         blocks = self.batch([("eth_getBlockByNumber", [hex(n), False]) for n in numbers])

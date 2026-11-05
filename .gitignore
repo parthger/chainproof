@@ -8,3 +8,6 @@ __pycache__/
 *.duckdb.wal
 run-*.json
 drafts/
+
+dashboard/
+site/

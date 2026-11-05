@@ -89,6 +89,8 @@ def decode_transfer(log: dict, chain_id: int) -> Transfer | None:
     amount = int(_hex32(data, "data"), 16)
 
     ts = log.get("blockTimestamp")
+    if ts is not None and int(ts, 16) == 0:
+        ts = None  # arb1 sends "0x0" instead of omitting the field: backfill the real block time
     return Transfer(
         chain_id=chain_id,
         block_number=int(log["blockNumber"], 16),

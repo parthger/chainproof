@@ -8,6 +8,7 @@ Each invariant catches a different class of bug, which is why there are several:
 | supply         | totalSupply(end) - totalSupply(start-1) vs mints - burns    | missed/double-counted mints and burns     |
 | balances       | balanceOf delta per busy holder vs inflow - outflow         | wrong amounts, swapped from/to, decimals  |
 | canonical      | stored block hashes vs the chain's hashes                   | rows from a reorged (orphaned) block      |
+| timestamps     | stored block_time vs the verifier's block timestamp         | wrong or placeholder times, wrong days    |
 | decimals       | decimals() on-chain vs config                               | a wrong token or a misconfigured unit     |
 
 A holder-to-holder transfer with a wrong amount does NOT move totalSupply, so the supply check
@@ -67,6 +68,7 @@ class Evidence:
     balances_before: dict[str, int]
     balances_after: dict[str, int]
     canonical_hashes: dict[int, str]
+    canonical_times: dict[int, int]
     verifier_rows: dict[tuple[int, int, int], tuple[str, str, str, int]]
     verifier_url: str = ""
 
@@ -125,6 +127,7 @@ def gather_evidence(
     rng = random.Random(end)
     sample = set(blocks[:1] + blocks[-1:] + rng.sample(blocks, min(8, len(blocks)))) if blocks else set()
     canonical = {n: verifier.block_hash(n) for n in sorted(sample)}
+    canonical_times = verifier.block_timestamps(sorted(sample)) if sample else {}
 
     # Independent re-read: a different endpoint and a different window size, so a bug in
     # paging or one provider's indexing cannot hide in both copies.
@@ -141,6 +144,7 @@ def gather_evidence(
         balances_before=b_before,
         balances_after=b_after,
         canonical_hashes=canonical,
+        canonical_times=canonical_times,
         verifier_rows=vrows,
         verifier_url=verifier_url,
     )
@@ -219,7 +223,21 @@ def evaluate(transfers: list[Transfer], ev: Evidence) -> list[CheckResult]:
         )
     )
 
-    # 5. decimals
+    # 5. timestamps: stored block_time equals the chain's timestamp for every sampled block
+    times_per_block: dict[int, set[int | None]] = defaultdict(set)
+    for t in transfers:
+        times_per_block[t.block_number].add(t.block_time)
+    wrong_time = sorted(b for b, ts in ev.canonical_times.items() if b in times_per_block and times_per_block[b] != {ts})
+    results.append(
+        CheckResult(
+            "timestamps",
+            not wrong_time,
+            f"{len(ev.canonical_times)} sampled blocks; wrong_block_time={len(wrong_time)}",
+            {"wrong": [(b, sorted(map(str, times_per_block[b])), ev.canonical_times[b]) for b in wrong_time[:5]]},
+        )
+    )
+
+    # 6. decimals
     results.append(
         CheckResult(
             "decimals",
@@ -230,11 +248,19 @@ def evaluate(transfers: list[Transfer], ev: Evidence) -> list[CheckResult]:
     return results
 
 
-def plant_fault(transfers: list[Transfer], ev: Evidence) -> tuple[list[Transfer], Transfer]:
-    """Add one raw unit to the largest transfer touching a sampled holder (or any transfer)."""
+def plant_fault(transfers: list[Transfer], ev: Evidence) -> tuple[list[Transfer], Transfer] | None:
+    """Add one raw unit to the largest transfer touching a sampled holder.
+
+    Self-transfers (from == to) are never picked: +1 on both sides of the same address cancels
+    out in its net flow, so the balances check could not see it and the canary would fail a run
+    whose data is correct. Returns None when no row can carry a detectable fault.
+    """
     watched = set(ev.balance_addresses)
-    candidates = [t for t in transfers if t.from_address in watched or t.to_address in watched] or transfers
-    victim = max(candidates, key=lambda t: t.amount_raw)
+    movable = [t for t in transfers if t.from_address != t.to_address]
+    candidates = [t for t in movable if t.from_address in watched or t.to_address in watched]
+    if not candidates:
+        return None
+    victim = max(candidates, key=lambda t: (t.amount_raw, t.key))
     mutated = [t.with_amount(t.amount_raw + 1) if t.key == victim.key else t for t in transfers]
     return mutated, victim
 
@@ -242,7 +268,10 @@ def plant_fault(transfers: list[Transfer], ev: Evidence) -> tuple[list[Transfer]
 def run_canary(transfers: list[Transfer], ev: Evidence) -> CheckResult:
     if not transfers:
         return CheckResult("canary", True, "no rows in range; nothing to mutate")
-    mutated, victim = plant_fault(transfers, ev)
+    planted = plant_fault(transfers, ev)
+    if planted is None:
+        return CheckResult("canary", True, "only self-transfers or unwatched rows in range; nothing detectable to mutate")
+    mutated, victim = planted
     caught = [r.name for r in evaluate(mutated, ev) if not r.passed]
     must = {"completeness", "balances"}
     ok = must.issubset(caught)

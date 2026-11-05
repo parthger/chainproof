@@ -106,3 +106,72 @@ def test_batch_results_follow_request_order_even_if_response_is_shuffled():
     c = client(responder)
     out = c.batch([("eth_chainId", [])] * 5)
     assert [int(x, 16) for x in out] == sorted(int(x, 16) for x in out)
+
+
+# ---- regressions found on 2026-11-05 ---------------------------------------
+
+
+@pytest.mark.parametrize("body", ["Too Many Requests", {"error": {"code": 429, "message": "rate limit exceeded"}}])
+def test_429_is_backed_off_never_treated_as_range_error(body):
+    # "too many" and "exceed" are range hints; a 429 must still back off, not shrink the range
+    c = client(lambda _: Resp(429, body))
+    with pytest.raises(EndpointUnhealthy):
+        c.chain_id()
+    assert c.requests_made == c.max_retries
+
+
+def test_jsonrpc_rate_limit_in_200_response_is_retried():
+    calls = {"n": 0}
+
+    def responder(payload):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return Resp(200, {"jsonrpc": "2.0", "id": payload["id"], "error": {"code": -32005, "message": "rate limit exceeded"}})
+        return Resp(200, {"jsonrpc": "2.0", "id": payload["id"], "result": "0x2105"})
+
+    assert client(responder).chain_id() == 8453
+
+
+def test_drpc_http_400_batch_error_shrinks_batch():
+    # drpc changed in Nov 2026: oversized batches now come back as HTTP 400, one error per item
+    def responder(payload):
+        if isinstance(payload, list) and len(payload) > 3:
+            return Resp(
+                400,
+                [
+                    {
+                        "id": p["id"],
+                        "jsonrpc": "2.0",
+                        "error": {"message": "Batch of more than 3 requests are not allowed on free plan", "code": 31},
+                    }
+                    for p in payload
+                ],
+            )
+        return Resp(200, [{"jsonrpc": "2.0", "id": p["id"], "result": hex(i)} for i, p in enumerate(payload)])
+
+    c = client(responder)
+    assert len(c.call_many([("0x" + "1" * 40, "0x18160ddd")] * 10, 100)) == 10
+    assert c.batch_size == 3  # 20 -> 10 -> 5 -> 3, not down to 2
+
+
+def test_pruned_state_is_classified():
+    from chainproof.rpc import StateUnavailable
+
+    body = {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "historical state 92ec is not available"}}
+    c = client(lambda _: Resp(200, body))
+    with pytest.raises(StateUnavailable):
+        c.call_many([("0x" + "1" * 40, "0x18160ddd")], 5)
+    assert c.requests_made == 4  # retried: load-balanced nodes keep different history
+
+
+def test_pruned_state_on_one_node_is_retried_onto_another():
+    calls = {"n": 0}
+    err = {"code": -32000, "message": "historical state 92ec is not available"}
+
+    def responder(payload):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return Resp(200, [{"jsonrpc": "2.0", "id": p["id"], "error": err} for p in payload])
+        return Resp(200, [{"jsonrpc": "2.0", "id": p["id"], "result": "0x2a"} for p in payload])
+
+    assert client(responder).call_many([("0x" + "1" * 40, "0x18160ddd")], 5) == ["0x2a"]
