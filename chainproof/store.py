@@ -178,6 +178,16 @@ class Store:
         )
         return run_id
 
+    def record_failure(self, chain_id: int, token: str, error: str) -> str:
+        """Log a run that failed before a range was chosen (dead RPC, wrong chain, reorg tripwire)."""
+        wm = self.watermark(chain_id, token)
+        nxt = wm[0] + 1 if wm else 0
+        run_id = self.begin_run(chain_id, token, nxt, nxt - 1)
+        self.con.execute(
+            "UPDATE runs SET status = 'failed', error = ?, finished_at = ? WHERE run_id = ?", [error[:4000], _now(), run_id]
+        )
+        return run_id
+
     def abandon_stale_runs(self, chain_id: int, token: str) -> int:
         """Mark runs left in 'staged' by a killed process as abandoned and drop their staged rows.
 
@@ -384,6 +394,9 @@ class Store:
         """Set the real block_time for the given blocks and rebuild every day they touched, old and new."""
         if not times:
             return 0
+        too_old = [b for b, ts in times.items() if ts < 1_438_214_400]
+        if too_old:
+            raise StoreError(f"refusing to repair blocks {too_old[:5]} with a time before Ethereum genesis")
         con = self.con
         con.execute("BEGIN TRANSACTION")
         try:

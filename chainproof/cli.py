@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from . import __version__
 from .config import get_chain, get_token
 from .decode import SEL_DECIMALS, SEL_SYMBOL, SEL_TOTAL_SUPPLY, decode_string, decode_uint, format_units
-from .pipeline import ReorgDetected, RunReport, find_rewind_point, run, sync
+from .pipeline import PipelineError, ReorgDetected, RunReport, find_rewind_point, run, sync
 from .reconcile import ReconciliationError
 from .rpc import RpcClient, RpcError
 from .store import Store
@@ -55,6 +55,10 @@ def _print_report(rep: RunReport) -> None:
 
 def cmd_run(args) -> int:
     chain, token = get_chain(args.chain), get_token(args.chain, args.token)
+    if args.holders < 1:
+        raise SystemExit("--holders must be at least 1: with no balance checks the canary cannot prove anything")
+    if args.time_budget <= 0:
+        raise SystemExit("--time-budget must be positive")
     reader, verifier = _clients(args)
     store = Store(args.db, decimals=token.decimals)
     print(f"chainproof {__version__}: {token.symbol} on {chain.name}")
@@ -102,6 +106,9 @@ def cmd_run(args) -> int:
     except RpcError as e:
         print(f"\nRPC FAILURE: {type(e).__name__}: {str(e)[:400]}", file=sys.stderr)
         return 4
+    except PipelineError as e:
+        print(f"\nREFUSED: {e}", file=sys.stderr)
+        return 5
     finally:
         if args.json and reports:
             with open(args.json, "w") as f:
@@ -109,8 +116,7 @@ def cmd_run(args) -> int:
     if args.until_head:
         published = [r for r in reports if r.status == "published"]
         rows = sum(r.rows for r in published)
-        last = reports[-1]
-        state = "caught up" if last.status == "noop" else "time budget reached, will continue next run"
+        state = "caught up" if reports and reports[-1].status == "noop" else "time budget reached, will continue next run"
         print(f"\n  total    {len(published)} published run(s), {rows} transfers; {state}")
     return 0
 
@@ -194,8 +200,12 @@ def cmd_dashboard(args) -> int:
         if not path:
             raise SystemExit(f"--db expects CHAIN=PATH, got {item!r}")
         sources.append((get_chain(name), get_token(name, args.token), path))
-    out = render(sources, args.out, hours=args.hours)
+    out, panels = render(sources, args.out, hours=args.hours, stale_hours=args.stale_hours)
     print(f"wrote {out}")
+    if not any(p.has_data for p in panels):
+        # Never let CI publish an empty page over a good one (e.g. when the live jobs were skipped).
+        print("no database had any runs; exiting non-zero so nothing gets published", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -238,6 +248,7 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--token", default="USDC")
     d.add_argument("--out", default="dashboard/index.html")
     d.add_argument("--hours", type=int, default=24, help="window for the headline numbers and the hourly chart")
+    d.add_argument("--stale-hours", type=float, default=3.0, help="flag a chain whose last publish is older than this")
     d.set_defaults(func=cmd_dashboard)
 
     s = sub.add_parser("status", help="watermark and recent runs")

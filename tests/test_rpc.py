@@ -175,3 +175,82 @@ def test_pruned_state_on_one_node_is_retried_onto_another():
         return Resp(200, [{"jsonrpc": "2.0", "id": p["id"], "result": "0x2a"} for p in payload])
 
     assert client(responder).call_many([("0x" + "1" * 40, "0x18160ddd")], 5) == ["0x2a"]
+
+
+# ---- findings from the 2026-11-05 review -----------------------------------
+
+
+def test_one_rate_limited_item_retries_the_whole_batch():
+    calls = {"n": 0}
+
+    def responder(payload):
+        calls["n"] += 1
+        out = [{"jsonrpc": "2.0", "id": p["id"], "result": "0x1"} for p in payload]
+        if calls["n"] == 1:
+            out[1] = {"jsonrpc": "2.0", "id": payload[1]["id"], "error": {"code": -32005, "message": "rate limit exceeded"}}
+        return Resp(200, out)
+
+    assert client(responder).call_many([("0x" + "1" * 40, "0x18160ddd")] * 3, 5) == ["0x1"] * 3
+
+
+def test_string_error_is_not_mistaken_for_a_rate_limit():
+    from chainproof.rpc import RpcError
+
+    c = client(lambda _: Resp(401, {"error": "invalid api key"}))
+    with pytest.raises(RpcError):
+        c.chain_id()
+    assert c.requests_made == 1  # a permanent auth error is not retried for a minute
+
+
+def test_infura_request_rate_exceeded_is_a_rate_limit_not_a_range_error():
+    body = {"jsonrpc": "2.0", "id": 1, "error": {"code": -32005, "message": "project ID request rate exceeded"}}
+    c = client(lambda _: Resp(200, body))
+    with pytest.raises(EndpointUnhealthy):
+        c.get_logs("0x" + "1" * 40, "0x" + "2" * 64, 1, 200)
+
+
+def test_5xx_batch_rate_limit_backs_off_and_keeps_batch_size():
+    calls = {"n": 0}
+
+    def responder(payload):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return Resp(503, "batch requests rate limit exceeded, retry later")
+        return Resp(200, [{"jsonrpc": "2.0", "id": p["id"], "result": "0x1"} for p in payload])
+
+    c = client(responder)
+    assert len(c.call_many([("0x" + "1" * 40, "0x18160ddd")] * 10, 5)) == 10
+    assert c.batch_size == 20
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Archive requests require a personal token. Get one at: https://www.allnodes.com",
+        "Unknown state. First available state is 1",
+    ],
+)
+def test_archive_refusals_are_classified_as_pruned_state(message):
+    from chainproof.rpc import StateUnavailable
+
+    body = {"jsonrpc": "2.0", "id": 1, "error": {"code": -32602, "message": message}}
+    with pytest.raises(StateUnavailable):
+        client(lambda _: Resp(200, body)).call_many([("0x" + "1" * 40, "0x18160ddd")], 5)
+
+
+def test_truncated_response_body_is_retried():
+    import requests
+
+    calls = {"n": 0}
+
+    class Truncated(Resp):
+        def json(self):
+            raise requests.exceptions.ChunkedEncodingError("Response ended prematurely")
+
+    def responder(payload):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return Truncated(200, {})
+        return Resp(200, {"jsonrpc": "2.0", "id": payload["id"], "result": "0x2105"})
+
+    assert client(responder).chain_id() == 8453

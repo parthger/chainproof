@@ -395,7 +395,7 @@ def test_dashboard_renders_pass_fail_and_gaps(tmp_path):
 
     # the fake chain lives in Oct 2025: render "as of" just after its last block
     last = datetime.fromtimestamp(chain.blocks[chain.head].timestamp, UTC)
-    out = render([(CHAIN, USDC, str(good_db)), (CHAIN, USDC, str(bad_db))], tmp_path / "d.html", now=last)
+    out, _ = render([(CHAIN, USDC, str(good_db)), (CHAIN, USDC, str(bad_db))], tmp_path / "d.html", now=last)
     page = out.read_text()
     assert "All checks passing" in page and "Latest run failed" in page
     assert "1 of 2 chains failing" in page
@@ -442,3 +442,134 @@ def test_1970_rows_from_an_old_database_are_repaired_on_the_next_run():
     assert store.bad_time_blocks(CHAIN.chain_id, TOKEN) == []
     assert datetime(1970, 1, 1).date() not in _mart(store)
     assert _mart(store) == _expected_daily(store)
+
+
+# ---- findings from the 2026-11-05 review -----------------------------------
+
+
+def _old_db_with_1970_rows(chain):
+    store = Store()
+    _run(chain, chain, store, max_blocks=60)
+    store.con.execute("ALTER TABLE transfers RENAME TO t_old")
+    store.con.execute("CREATE TABLE transfers AS SELECT * FROM t_old")
+    store.con.execute("DROP TABLE t_old")
+    store.con.execute("UPDATE transfers SET block_time = TIMESTAMP '1970-01-01' WHERE block_number < ?", [chain.first + 30])
+    return store
+
+
+def test_timestamp_repair_never_runs_against_the_wrong_chain():
+    chain = FakeChain(n_blocks=200)
+    store = _old_db_with_1970_rows(chain)
+    bad_before = store.bad_time_blocks(CHAIN.chain_id, TOKEN)
+    wrong = FakeChain(n_blocks=200, chain_id=1)
+    with pytest.raises(Exception, match="chain 1, expected 8453"):
+        _run(wrong, wrong, store)
+    assert store.bad_time_blocks(CHAIN.chain_id, TOKEN) == bad_before  # untouched
+    assert store.runs(1)[0][5] == "failed"  # and the refusal is in the run log
+
+
+def test_timestamp_repair_needs_both_sources_to_agree():
+    from chainproof.pipeline import PipelineError
+
+    chain = FakeChain(n_blocks=200)
+    store = _old_db_with_1970_rows(chain)
+
+    class Shifted(FaultyReader):
+        def block_timestamps(self, numbers):
+            return {n: ts + 3600 for n, ts in self.inner.block_timestamps(numbers).items()}
+
+    with pytest.raises(PipelineError, match="cannot repair block_time"):
+        _run(chain, Shifted(chain), store)
+    assert store.bad_time_blocks(CHAIN.chain_id, TOKEN)  # nothing written from a single source
+
+
+def test_max_lag_below_lookback_never_moves_start_backwards():
+    chain = FakeChain(n_blocks=400)
+    store = Store()
+    r1 = _run(chain, chain, store, max_blocks=1_000)  # caught up to finality
+    chain.advance(80)  # lag is now 80: above max_lag=50, below lookback=200
+    r2 = _run(chain, chain, store, max_lag=50, lookback_blocks=200, max_blocks=1_000)
+    assert r2.status == "published" and r2.gap is None
+    assert r2.start == r1.end + 1
+    assert store.gaps(CHAIN.chain_id, TOKEN) == []
+
+
+def test_reorg_tripwire_is_recorded_as_a_failed_run():
+    chain = FakeChain()
+    store = Store()
+    r = _run(chain, chain, store)
+    chain.reorg(r.end - 3)
+    with pytest.raises(ReorgDetected):
+        _run(chain, chain, store)
+    latest = store.runs(1)[0]
+    assert latest[5] == "failed" and "ReorgDetected" in latest[7]
+
+
+def _render_one(tmp_path, store_path, now=None, **kw):
+    from chainproof.dashboard import render
+
+    _, (panel,) = render([(CHAIN, USDC, str(store_path))], tmp_path / "d.html", now=now, **kw)
+    return panel, (tmp_path / "d.html").read_text()
+
+
+def test_dashboard_is_not_green_when_the_latest_run_did_not_finish(tmp_path):
+    chain = FakeChain(n_blocks=200)
+    db = tmp_path / "a.duckdb"
+    store = Store(db)
+    _run(chain, chain, store, max_blocks=50)
+    store.begin_run(8453, TOKEN, 9_999, 10_000)  # killed mid-run: left 'staged'
+    store.close()
+    panel, page = _render_one(tmp_path, db)
+    assert panel.state == "warning" and "did not finish" in page
+
+
+def test_dashboard_flags_stale_data(tmp_path):
+    from datetime import timedelta
+
+    chain = FakeChain(n_blocks=200)
+    db = tmp_path / "a.duckdb"
+    store = Store(db)
+    _run(chain, chain, store, max_blocks=50)
+    store.close()
+    panel, page = _render_one(tmp_path, db, now=datetime.now(UTC) + timedelta(hours=5), stale_hours=3)
+    assert panel.state == "warning" and "Stale" in page
+
+
+def test_dashboard_shows_a_failure_before_the_gate_without_borrowing_green(tmp_path):
+    chain = FakeChain(n_blocks=200)
+    db = tmp_path / "a.duckdb"
+    store = Store(db)
+    _run(chain, chain, store, max_blocks=50)
+    store.record_failure(8453, TOKEN, "EndpointUnhealthy: gave up after 6 attempts")
+    store.close()
+    panel, page = _render_one(tmp_path, db)
+    assert panel.state == "failed"
+    assert "Checks below are from the last published run" in page
+
+
+def test_one_unreadable_database_does_not_take_down_the_dashboard(tmp_path):
+    from chainproof.dashboard import render
+
+    good = tmp_path / "good.duckdb"
+    chain = FakeChain(n_blocks=200)
+    s = Store(good)
+    _run(chain, chain, s, max_blocks=50)
+    s.close()
+    junk = tmp_path / "junk.duckdb"
+    junk.write_bytes(b"not a database")
+    _, panels = render([(CHAIN, USDC, str(good)), (CHAIN, USDC, str(junk))], tmp_path / "d.html")
+    assert [p.state for p in panels] == ["ok", "failed"]
+    assert panels[1].verdict == "database unreadable"
+
+
+def test_dashboard_command_fails_when_no_database_has_data(tmp_path):
+    from chainproof.cli import main
+
+    assert main(["dashboard", "--db", f"base={tmp_path}/missing.duckdb", "--out", str(tmp_path / "d.html")]) == 1
+
+
+def test_holders_zero_is_refused():
+    from chainproof.cli import main
+
+    with pytest.raises(SystemExit, match="holders"):
+        main(["run", "--holders", "0", "--db", ":memory:"])

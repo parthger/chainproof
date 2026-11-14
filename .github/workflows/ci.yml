@@ -9,7 +9,9 @@ on:
 
 # Never let two live runs write the same cached database at once.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' && 'live' || github.ref }}
+  # Parenthesised on purpose: `a || b && 'live'` would give schedule runs the group "true" and
+  # dispatch runs "live", letting the two write the same database at once.
+  group: ${{ github.workflow }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'live' || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -31,18 +33,22 @@ jobs:
     needs: offline
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
         include:
           # blocks: first-run / re-anchor lookback. max_blocks: per gated run. max_lag: beyond this,
-          # free RPCs no longer serve the state needed to verify, so skip ahead and record a gap.
-          - { chain: base, blocks: 900, max_blocks: 1800, max_lag: 10800 }
-          - { chain: ethereum, blocks: 150, max_blocks: 600, max_lag: 1800 }
-          # Arbitrum makes ~14,400 blocks an hour and its public RPC only reliably serves ~1,000
-          # blocks of state, so on free endpoints each hourly run verifies a recent window and
-          # records the rest as a gap. Pass an archive RPC with --rpc for full continuity.
+          # skip ahead and record a gap instead of trying to verify. Measured 2026-11-14:
+          #   Base: 0.2 s blocks; base.drpc.org serves state >= 400,000 blocks (~22 h) back.
+          #   Ethereum: 12 s blocks; eth.drpc.org serves state >= 10,000 blocks (~33 h) back.
+          #   Arbitrum: 0.25 s blocks; arb1 only reliably serves ~1,000 blocks of state.
+          # GitHub runs "hourly" schedules every ~5-8 h in practice, so the lag limits allow ~16 h.
+          # A range whose state turns out to be pruned anyway still re-anchors (reanchor-on-missing-state).
+          - { chain: base, blocks: 4500, max_blocks: 9000, max_lag: 300000 }
+          - { chain: ethereum, blocks: 150, max_blocks: 1200, max_lag: 5000 }
+          # Arbitrum makes ~14,400 blocks an hour, so on free endpoints each run verifies a recent
+          # window and records the rest as a gap. Pass an archive RPC with --rpc for full continuity.
           - { chain: arbitrum, blocks: 800, max_blocks: 4000, max_lag: 1500 }
     env:
       DB: chainproof-${{ matrix.chain }}.duckdb
@@ -57,14 +63,14 @@ jobs:
       - uses: actions/cache/restore@v4
         with:
           path: ${{ env.DB }}
-          key: db-${{ matrix.chain }}-${{ github.run_id }}
+          key: db-${{ matrix.chain }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: db-${{ matrix.chain }}-
       - name: inspect contract
         run: chainproof inspect --chain ${{ matrix.chain }}
       - name: catch up + reconcile (fails the job on any difference)
         run: >
           chainproof run --chain ${{ matrix.chain }} --db $DB
-          --until-head --time-budget 900
+          --until-head --time-budget 2400
           --blocks ${{ matrix.blocks }} --max-blocks ${{ matrix.max_blocks }} --max-lag ${{ matrix.max_lag }}
           --reanchor-on-missing-state --auto-rewind --json run-${{ matrix.chain }}.json
       - name: report
@@ -77,7 +83,7 @@ jobs:
         if: always()
         with:
           path: ${{ env.DB }}
-          key: db-${{ matrix.chain }}-${{ github.run_id }}
+          key: db-${{ matrix.chain }}-${{ github.run_id }}-${{ github.run_attempt }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -91,7 +97,11 @@ jobs:
   dashboard:
     name: dashboard
     needs: live
-    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    # Run even when a live job failed (the page must show the failure), but not when the live jobs
+    # never ran or the workflow was cancelled: that would publish an empty page over a good one.
+    if: >-
+      !cancelled() && needs.live.result != 'skipped'
+      && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -121,7 +131,7 @@ jobs:
   pages:
     name: publish dashboard
     needs: dashboard
-    if: always() && needs.dashboard.result == 'success' && vars.PAGES_ENABLED == 'true'
+    if: ${{ !cancelled() && needs.dashboard.result == 'success' && vars.PAGES_ENABLED == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       pages: write

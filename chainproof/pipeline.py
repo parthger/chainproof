@@ -25,6 +25,8 @@ from .store import Store
 
 log = logging.getLogger(__name__)
 
+GENESIS_TS = 1_438_214_400  # 2015-07-30 00:00 UTC, Ethereum genesis: no real block is older
+
 
 class PipelineError(RuntimeError):
     pass
@@ -114,42 +116,31 @@ def sync(
     return reports
 
 
-def run(
+def _prepare(
     reader: ChainReader,
     verifier: ChainReader,
     store: Store,
     chain: Chain,
     token: Token,
-    *,
-    lookback_blocks: int = 1_000,
-    from_block: int | None = None,
-    max_blocks: int = 5_000,
-    chunk: int = 200,
-    balance_k: int = 10,
-    canary: bool = True,
-    auto_rewind: bool = False,
-    max_lag: int | None = None,
-) -> RunReport:
-    """One gated run. `max_lag`: if the watermark is more than this many blocks behind finality,
-    skip ahead to the last `lookback_blocks` and record the skipped range as a gap. Public RPCs
-    prune old state, so a range that starts too far back can no longer be verified at all."""
-    t0 = time.monotonic()
+    lookback_blocks: int,
+    from_block: int | None,
+    max_blocks: int,
+    auto_rewind: bool,
+    max_lag: int | None,
+) -> tuple[int, int, int, int | None, tuple[int, int] | None, int]:
+    """Everything before a run is staged: sanity checks, repairs, reorg tripwire, range choice."""
     addr = token.address
     abandoned = store.abandon_stale_runs(chain.chain_id, addr)
     if abandoned:
         log.warning("marked %d stale staged run(s) as abandoned", abandoned)
-    bad = store.bad_time_blocks(chain.chain_id, addr)
-    if bad:
-        times: dict[int, int] = {}
-        for i in range(0, len(bad), 200):
-            times.update(reader.block_timestamps(bad[i : i + 200]))
-        fixed = store.repair_block_times(chain.chain_id, addr, times)
-        log.warning("repaired block_time on %d published rows in %d blocks", fixed, len(bad))
 
+    # Refuse a misconfigured RPC before touching anything, repairs included.
     for name, r in (("primary", reader), ("verifier", verifier)):
         cid = r.chain_id()
         if cid != chain.chain_id:
             raise PipelineError(f"{name} RPC is chain {cid}, expected {chain.chain_id} ({chain.name})")
+
+    repair_timestamps(store, reader, verifier, chain, token)
 
     fin_a, _ = reader.finalized_block()
     fin_b, _ = verifier.finalized_block()
@@ -172,14 +163,72 @@ def run(
             deleted = store.rewind(chain.chain_id, addr, to_block, to_hash)
             log.warning("reorg: rewound to block %d, deleted %d rows", to_block, deleted)
             rewound_to, wm_block = to_block, to_block
-        if max_lag is not None and finalized - wm_block > max_lag:
+        # Skip ahead only when the lag exceeds max_lag AND the new start is past the watermark.
+        # (With max_lag < lookback, a lag in between would otherwise move start backwards.)
+        if max_lag is not None and finalized - wm_block > max_lag and finalized - lookback_blocks > wm_block:
             gap = reanchor(store, reader, chain, token, finalized, lookback_blocks, f"lag {finalized - wm_block} > {max_lag}")
-            wm_block = finalized - lookback_blocks
+            if gap is not None:
+                wm_block = gap[1]
         start = wm_block + 1
     else:
         start = from_block if from_block is not None else finalized - lookback_blocks + 1
 
     end = min(finalized, start + max_blocks - 1)
+    return start, end, finalized, rewound_to, gap, abandoned
+
+
+def repair_timestamps(store: Store, reader: ChainReader, verifier: ChainReader, chain: Chain, token: Token) -> int:
+    """Re-time published rows stored with an impossible block_time (0.1.0 stored arb1's "0x0" as 1970).
+
+    The same two-source rule as the gate: a block's time is written only if the primary and the
+    verifier agree on it and it is after Ethereum genesis. Any disagreement stops the run.
+    """
+    bad = store.bad_time_blocks(chain.chain_id, token.address)
+    if not bad:
+        return 0
+    times: dict[int, int] = {}
+    for i in range(0, len(bad), 200):
+        part = bad[i : i + 200]
+        a, b = reader.block_timestamps(part), verifier.block_timestamps(part)
+        for n in part:
+            if n not in a or a.get(n) != b.get(n) or a[n] < GENESIS_TS:
+                raise PipelineError(f"cannot repair block_time of block {n}: primary={a.get(n)} verifier={b.get(n)}")
+            times[n] = a[n]
+    fixed = store.repair_block_times(chain.chain_id, token.address, times)
+    log.warning("repaired block_time on %d published rows in %d blocks (primary and verifier agree)", fixed, len(bad))
+    return fixed
+
+
+def run(
+    reader: ChainReader,
+    verifier: ChainReader,
+    store: Store,
+    chain: Chain,
+    token: Token,
+    *,
+    lookback_blocks: int = 1_000,
+    from_block: int | None = None,
+    max_blocks: int = 5_000,
+    chunk: int = 200,
+    balance_k: int = 10,
+    canary: bool = True,
+    auto_rewind: bool = False,
+    max_lag: int | None = None,
+) -> RunReport:
+    """One gated run. `max_lag`: if the watermark is more than this many blocks behind finality,
+    skip ahead to the last `lookback_blocks` and record the skipped range as a gap. Public RPCs
+    prune old state, so a range that starts too far back can no longer be verified at all."""
+    t0 = time.monotonic()
+    addr = token.address
+    try:
+        start, end, finalized, rewound_to, gap, abandoned = _prepare(
+            reader, verifier, store, chain, token, lookback_blocks, from_block, max_blocks, auto_rewind, max_lag
+        )
+    except Exception as e:
+        # Failures before a range is chosen (dead RPC, wrong chain, reorg tripwire) still go in the
+        # run log, so `status` and the dashboard can never show an old green run as current.
+        store.record_failure(chain.chain_id, addr, f"{type(e).__name__}: {e}")
+        raise
     report = RunReport(None, chain.name, token.symbol, start, end, finalized, rewound_to=rewound_to, gap=gap, abandoned=abandoned)
     if end < start:
         report.seconds = time.monotonic() - t0

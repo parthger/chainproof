@@ -64,8 +64,16 @@ class ChainReader(Protocol):
 
 # Rate limits must be checked BEFORE range hints: "Too Many Requests" and "rate limit exceeded"
 # contain "too many" and "exceed", and halving a range never fixes a rate limit.
-_RATE_HINTS = ("rate limit", "too many requests", "request limit", "throttl", "capacity", "slow down")
-_STATE_HINTS = ("historical state", "missing trie node", "state is not available", "state not available", "pruned")
+_RATE_HINTS = ("rate limit", "rate exceeded", "too many requests", "request limit", "throttl", "capacity", "slow down")
+_STATE_HINTS = (
+    "historical state",
+    "missing trie node",
+    "state is not available",
+    "state not available",
+    "pruned",
+    "archive request",  # publicnode: "Archive requests require a personal token"
+    "unknown state",  # drpc: "Unknown state. First available state is ..."
+)
 
 
 def _looks_like_rate_limit(message: str) -> bool:
@@ -82,6 +90,8 @@ def _looks_like_range_error(message: str) -> bool:
 
 def _looks_like_batch_limit(message: str) -> bool:
     m = message.lower()
+    if _looks_like_rate_limit(m):
+        return False  # "batch requests rate limit exceeded" is a rate limit: back off, keep the batch size
     return "batch" in m and any(h in m for h in ("not allowed", "too large", "more than", "exceed", "limit"))
 
 
@@ -121,6 +131,8 @@ class RpcClient:
                     raise requests.HTTPError(f"HTTP 429: {r.text[:300]}")  # always back off, never shrink
                 if r.status_code >= 500:
                     body = r.text[:300]
+                    if _looks_like_rate_limit(body):
+                        raise requests.HTTPError(f"HTTP {r.status_code}: {body}")
                     if _looks_like_batch_limit(body):
                         raise BatchTooLarge(body)
                     if _looks_like_range_error(body):
@@ -151,7 +163,9 @@ class RpcClient:
                 return body
             except (RangeTooLarge, BatchTooLarge):
                 raise
-            except (requests.ConnectionError, requests.Timeout, requests.HTTPError, ValueError, _Retryable) as e:
+            # RequestException covers connection resets, timeouts, HTTP errors and truncated bodies
+            # (ChunkedEncodingError: "Response ended prematurely"), all transient on public endpoints.
+            except (requests.RequestException, ValueError, _Retryable) as e:
                 last = e
                 sleep = self.backoff_base * (2**attempt) * (1 + random.random() * 0.25)
                 time.sleep(sleep)
@@ -159,12 +173,23 @@ class RpcClient:
 
     @staticmethod
     def _is_rate_limited(body: Any) -> bool:
-        """A 200 response whose JSON-RPC error (or every batch item's error) is a rate limit."""
+        """True if any JSON-RPC error in the body (one object, or any batch item) is a rate limit.
+
+        Every call chainproof makes is a read, so retrying a whole batch when one item was throttled
+        is safe, and failing the run on a transient throttle is not acceptable.
+        """
         items = body if isinstance(body, list) else [body]
-        errs = [x.get("error") for x in items if isinstance(x, dict)]
-        if not errs or not all(errs):
-            return False
-        return all(_looks_like_rate_limit(f"{e.get('code')} {e.get('message')}") for e in errs if isinstance(e, dict))
+        for x in items:
+            err = x.get("error") if isinstance(x, dict) else None
+            if isinstance(err, dict):
+                text = f"{err.get('code')} {err.get('message')}"
+            elif isinstance(err, str):
+                text = err
+            else:
+                continue
+            if _looks_like_rate_limit(text):
+                return True
+        return False
 
     def _next_id(self) -> int:
         self._id += 1
@@ -174,7 +199,10 @@ class RpcClient:
     def _unwrap(resp: dict) -> Any:
         if "error" in resp and resp["error"] is not None:
             err = resp["error"]
-            msg = f"{err.get('code')}: {err.get('message')} {err.get('data') or ''}".strip()
+            if isinstance(err, dict):
+                msg = f"{err.get('code')}: {err.get('message')} {err.get('data') or ''}".strip()
+            else:
+                msg = str(err)
             if _looks_like_range_error(msg):
                 raise RangeTooLarge(msg)
             if any(h in msg.lower() for h in _STATE_HINTS):

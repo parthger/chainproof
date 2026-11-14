@@ -86,6 +86,8 @@ One invariant is never enough. A holder-to-holder transfer with a wrong amount d
 7. `arb1.arbitrum.io` returns `"blockTimestamp": "0x0"` on logs instead of omitting the field. 0.1.0 stored those transfers as **1970-01-01**, and no check noticed, because none looked at time. The `timestamps` check exists because of this, and old databases are repaired on the next run.
 8. `arb1.arbitrum.io` load-balances across nodes that keep different amounts of history. The same `eth_call` at 2,400 blocks behind finality succeeds on one request and fails with "historical state is not available" on the next. Pruned-state errors are retried before they count.
 9. A 429 body says "Too Many Requests" or "rate limit exceeded". Both contain words that look like a range error ("too many", "exceed"). Rate limits are classified first, and always back off.
+10. Base now produces a block every **0.2 s**, not 2 s. Lag limits written in blocks were suddenly ten times too tight, and every run skipped hours it could have verified. The CI limits now come from measured state depth (`base.drpc.org` serves at least 400,000 blocks back, `eth.drpc.org` at least 10,000).
+11. GitHub runs an "hourly" schedule every **5-8 hours** in practice on a quiet repo. Each run therefore has a 40-minute catch-up budget instead of assuming an hour of lag.
 
 ## Quickstart
 
@@ -118,7 +120,7 @@ chainproof dashboard --out dashboard/index.html \
 ## Tests
 
 ```bash
-pytest   # 48 tests, ~3 s, no network
+pytest   # 65 tests, ~4 s, no network
 ```
 
 The suite runs the real pipeline against `tests/fake_chain.py`, an in-memory chain with real log shapes, state at every block, and controllable faults. That covers what a public RPC never lets you force:
@@ -158,7 +160,7 @@ chainproof/
   cli.py        run | status | report | rewind | inspect | dashboard
 docs/
   spec-usdc.md  indexing spec written before the code
-tests/          fake chain + 48 tests
+tests/          fake chain + 65 tests
 ```
 
 ## Limitations

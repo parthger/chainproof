@@ -26,9 +26,10 @@ CHECK_ORDER = ["completeness", "supply", "balances", "canonical", "timestamps", 
 class ChainPanel:
     chain: Chain
     token: Token
-    ok: bool = False
+    state: str = "nodata"  # ok | failed | warning | nodata
     has_data: bool = False
     verdict: str = "no data"
+    checks_note: str = ""
     last_run_at: datetime | None = None
     last_published_at: datetime | None = None
     watermark: int | None = None
@@ -48,6 +49,10 @@ class ChainPanel:
     gaps: list[tuple] = field(default_factory=list)
     recent: list[tuple] = field(default_factory=list)
 
+    @property
+    def ok(self) -> bool:
+        return self.state == "ok"
+
 
 def _cols(con: duckdb.DuckDBPyConnection, table: str) -> set[str]:
     return {r[0] for r in con.execute(f"SELECT column_name FROM duckdb_columns() WHERE table_name = '{table}'").fetchall()}
@@ -57,7 +62,17 @@ def _tables(con: duckdb.DuckDBPyConnection) -> set[str]:
     return {r[0] for r in con.execute("SELECT table_name FROM duckdb_tables()").fetchall()}
 
 
-def load_panel(chain: Chain, token: Token, path: str, now: datetime, hours: int) -> ChainPanel:
+def load_panel(chain: Chain, token: Token, path: str, now: datetime, hours: int, stale_hours: float = 3.0) -> ChainPanel:
+    """One chain's panel. Never raises: an unreadable database becomes a red panel, not a crash."""
+    try:
+        return _load_panel(chain, token, path, now, hours, stale_hours)
+    except Exception as e:
+        p = ChainPanel(chain, token, state="failed", has_data=True, verdict="database unreadable")
+        p.last_error = f"{type(e).__name__}: {e}"[:220]
+        return p
+
+
+def _load_panel(chain: Chain, token: Token, path: str, now: datetime, hours: int, stale_hours: float) -> ChainPanel:
     p = ChainPanel(chain, token)
     if not Path(path).exists():
         p.verdict = "database not found"
@@ -100,18 +115,35 @@ def load_panel(chain: Chain, token: Token, path: str, now: datetime, hours: int)
                     p.total_supply_raw = int(sup["detail"]["supply_after"])
                     p.total_supply_block = int(last_pub[2])
 
+            # The verdict follows the LATEST run, whatever its status. Only a finished, published
+            # latest run that is also recent is green; anything else must not look like success.
             if latest[3] == "failed":
-                p.ok = False
+                p.state = "failed"
                 p.verdict = "latest run FAILED"
                 p.last_error = (latest[6] or "").splitlines()[0][:220] if latest[6] else None
                 failed_checks = json.loads(latest[5] or "[]")
                 if failed_checks:
                     p.checks = failed_checks
-            elif last_pub:
-                p.ok = True
-                p.verdict = "all checks passing"
+                elif last_pub:
+                    p.checks_note = (
+                        f"Failed before the gate ran. Checks below are from the last published run, {_ago(last_pub[8], now)}."
+                    )
+                else:
+                    p.checks = []
+            elif latest[3] != "published":
+                p.state = "warning"
+                p.verdict = "latest run did not finish" if latest[3] in ("staged", "abandoned") else f"latest run {latest[3]}"
+                if last_pub:
+                    p.checks_note = f"Checks below are from the last published run, {_ago(last_pub[8], now)}."
             else:
-                p.verdict = f"latest run {latest[3]}"
+                p.state = "ok"
+                p.verdict = "all checks passing"
+            age_h = (
+                None if not last_pub or last_pub[8] is None else (now.replace(tzinfo=None) - last_pub[8]).total_seconds() / 3600
+            )
+            if p.state == "ok" and age_h is not None and age_h > stale_hours:
+                p.state = "warning"
+                p.verdict = f"stale: last publish {age_h:.0f} h ago"
 
         row = con.execute(
             """SELECT count(*),
@@ -256,9 +288,8 @@ def _short(v: int) -> str:
 def _panel(p: ChainPanel, now: datetime, hours: int) -> str:
     d = p.token.decimals
     sym = p.token.symbol
-    status = _badge("good", "All checks passing") if p.ok else _badge("critical", p.verdict.capitalize())
-    if not p.has_data:
-        status = _badge("warning", p.verdict.capitalize())
+    kind = {"ok": "good", "failed": "critical"}.get(p.state, "warning")
+    status = _badge(kind, "All checks passing" if p.ok else p.verdict.capitalize())
 
     fresh = (
         "–"
@@ -301,6 +332,8 @@ def _panel(p: ChainPanel, now: datetime, hours: int) -> str:
         else '<div class="empty">No check results recorded yet.</div>'
     )
     err = f'<div class="error mono">{_e(p.last_error)}</div>' if p.last_error else ""
+    if p.checks_note:
+        checks = f'<div class="note">{_e(p.checks_note)}</div>' + checks
 
     gap_html = ""
     if p.gaps:
@@ -312,7 +345,8 @@ def _panel(p: ChainPanel, now: datetime, hours: int) -> str:
         )
 
     run_rows = "".join(
-        f'<tr><td class="mono">{(r[8] or r[7]):%m-%d %H:%M}</td><td class="mono">{int(r[1]):,}–{int(r[2]):,}</td>'
+        f'<tr><td class="mono">{(r[8] or r[7]):%m-%d %H:%M}</td>'
+        f'<td class="mono">{f"{int(r[1]):,}–{int(r[2]):,}" if int(r[2]) >= int(r[1]) else "before range"}</td>'
         f'<td>{_e(r[3])}</td><td class="num">{"" if r[4] is None else f"{int(r[4]):,}"}</td></tr>'
         for r in p.recent[:5]
     )
@@ -324,7 +358,7 @@ def _panel(p: ChainPanel, now: datetime, hours: int) -> str:
     )
 
     return f"""
-    <section class="panel {"ok" if p.ok else "bad"}">
+    <section class="panel {p.state}">
       <div class="head">
         <header><h2>{_e(sym)} on {_e(p.chain.name.capitalize())}</h2>{status}</header>
         <div class="meta">last run {_ago(p.last_run_at, now)} · {p.runs_published} published, {p.runs_failed} failed in {hours}h
@@ -391,6 +425,7 @@ table{width:100%;border-collapse:collapse}
 .gap,.error{display:flex;gap:8px;align-items:flex-start;font-size:12.5px;color:var(--text2)}
 .error{background:var(--critical-bg);color:var(--critical-ink);padding:8px 10px;border-radius:8px;word-break:break-word}
 .empty{color:var(--muted);font-size:12.5px;padding:8px 0}
+.note{color:var(--warning-ink);font-size:12px;margin-bottom:6px}
 details summary{cursor:pointer;color:var(--text2);font-size:12.5px}
 .runs th,.runs td{text-align:left;padding:4px 6px;font-size:12px;border-top:1px solid var(--border)}
 .runs th{color:var(--muted);font-weight:500}
@@ -410,15 +445,22 @@ const x=Math.min(e.clientX+12,innerWidth-tip.offsetWidth-8);tip.style.left=x+'px
 """
 
 
-def render(sources: list[tuple[Chain, Token, str]], out: str | Path, *, hours: int = 24, now: datetime | None = None) -> Path:
+def render(
+    sources: list[tuple[Chain, Token, str]],
+    out: str | Path,
+    *,
+    hours: int = 24,
+    stale_hours: float = 3.0,
+    now: datetime | None = None,
+) -> tuple[Path, list[ChainPanel]]:
     now = now or datetime.now(UTC)
-    panels = [load_panel(c, t, path, now, hours) for c, t, path in sources]
-    failing = [p for p in panels if p.has_data and not p.ok]
-    empty = [p for p in panels if not p.has_data]
+    panels = [load_panel(c, t, path, now, hours, stale_hours) for c, t, path in sources]
+    failing = [p for p in panels if p.state == "failed"]
+    warning = [p for p in panels if p.state in ("warning", "nodata")]
     if failing:
         overall = _badge("critical", f"{len(failing)} of {len(panels)} chains failing")
-    elif empty:
-        overall = _badge("warning", f"{len(panels) - len(empty)} of {len(panels)} chains reporting")
+    elif warning:
+        overall = _badge("warning", f"{len(panels) - len(warning)} of {len(panels)} chains healthy")
     else:
         overall = _badge("good", f"All checks passing on {len(panels)} chains")
     total_tx = sum(p.transfers for p in panels)
@@ -442,4 +484,4 @@ def render(sources: list[tuple[Chain, Token, str]], out: str | Path, *, hours: i
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(page)
-    return out
+    return out, panels
